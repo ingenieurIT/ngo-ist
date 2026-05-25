@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getSession } from "@/lib/auth";
 import { getWorkingDaysOfMonth, isOnLeave, toIsoDate, calcMonthStats } from "@/lib/utils";
-import { isSunday } from "date-fns";
+import { format } from "date-fns";
 
 /**
  * GET /api/monthly-sheet?userId=xxx&month=5&year=2026
@@ -24,10 +24,28 @@ export async function GET(req: NextRequest) {
 
   const targetMonthDate = new Date(year, month - 1, 1);
 
-  const userRecord = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { id: true, createdAt: true },
-  });
+  let userRecord: { id: string; createdAt: Date; templatePreference?: "A" | "B" | null } | null = null;
+  try {
+    userRecord = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, createdAt: true, templatePreference: true },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const knownCode = typeof err === "object" && err !== null && "code" in err
+      ? String((err as { code?: string }).code)
+      : "";
+
+    if (knownCode === "P2022" || message.includes("templatePreference") || message.includes("Unknown field")) {
+      const fallback = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { id: true, createdAt: true },
+      });
+      userRecord = fallback ? { ...fallback, templatePreference: null } : null;
+    } else {
+      throw err;
+    }
+  }
 
   if (!userRecord) {
     return Response.json({ error: "Utilisateur introuvable" }, { status: 404 });
@@ -49,8 +67,16 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  const monthStart = new Date(year, month - 1, 1);
-  const monthEnd = new Date(year, month, 0);
+  // Use local date string for "today" (correct calendar date for the user's timezone),
+  // then create a UTC midnight Date for consistent DB comparisons with @db.Date fields.
+  const todayDateStr = format(now, "yyyy-MM-dd"); // local YYYY-MM-DD
+  const today = new Date(todayDateStr + "T00:00:00.000Z"); // UTC midnight
+  const isCurrentMonth = today.getUTCFullYear() === year && today.getUTCMonth() + 1 === month;
+  // Admins see the full month layout; employees only see days up to today.
+  const isAdminViewer = session.role === "ADMIN";
+  // UTC midnight boundaries for correct @db.Date range queries
+  const monthStart = new Date(Date.UTC(year, month - 1, 1));
+  const monthEnd = isCurrentMonth && !isAdminViewer ? today : new Date(Date.UTC(year, month, 0));
 
   // Ensure monthly sheet record exists
   await prisma.monthlySheet.upsert({
@@ -80,7 +106,9 @@ export async function GET(req: NextRequest) {
     prisma.dayLockConfig.findUnique({ where: { id: "global" } }),
   ]);
 
-  const workingDays = getWorkingDaysOfMonth(year, month);
+  const workingDays = getWorkingDaysOfMonth(year, month).filter(
+    (d) => isAdminViewer || !isCurrentMonth || toIsoDate(d) <= todayDateStr
+  );
   const approvedLeaves = leaves.map((l) => ({ startDate: l.startDate, endDate: l.endDate }));
 
   const days = workingDays.map((day) => {
@@ -116,16 +144,22 @@ export async function GET(req: NextRequest) {
     };
   });
 
-  // Compute stats for display
-  const dayStats = days.map((d) => ({
-    date: d.date,
-    totalPredefined: assignments.length,
-    donePredefined: d.predefinedLogs.filter((l) => l.done).length,
-    totalExtra: d.extraLogs.length,
-    doneExtra: d.extraLogs.filter((l) => l.done).length,
-    isLeave: d.isLeave,
-    isSundayDay: false, // already filtered
-  }));
+  // Stats use only elapsed working days (up to today) for the current month;
+  // for past months use all days. This aligns with the dashboard's monthly stats.
+  const statsDaySet = new Set(
+    (isCurrentMonth ? workingDays.filter((d) => toIsoDate(d) <= todayDateStr) : workingDays).map((d) => toIsoDate(d))
+  );
+  const dayStats = days
+    .filter((d) => statsDaySet.has(d.date))
+    .map((d) => ({
+      date: d.date,
+      totalPredefined: assignments.length,
+      donePredefined: d.predefinedLogs.filter((l) => l.done).length,
+      totalExtra: d.extraLogs.length,
+      doneExtra: d.extraLogs.filter((l) => l.done).length,
+      isLeave: d.isLeave,
+      isSundayDay: false,
+    }));
   const stats = calcMonthStats(dayStats);
 
   return Response.json({
@@ -137,7 +171,9 @@ export async function GET(req: NextRequest) {
     maxYear: maxDate.getFullYear(),
     maxMonth: maxDate.getMonth() + 1,
     lockMode: lockConfig?.mode ?? "FREE",
-    template: lockConfig?.template ?? "A",
+    globalTemplate: lockConfig?.template ?? "A",
+    userTemplate: userRecord.templatePreference,
+    template: userRecord.templatePreference ?? lockConfig?.template ?? "A",
     assignments: assignments.map((a) => ({
       taskId: a.taskId,
       group: a.task.group,
